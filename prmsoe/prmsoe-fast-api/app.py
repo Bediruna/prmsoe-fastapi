@@ -38,6 +38,7 @@ image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "google-genai",
     "httpx",
     "python-multipart",
+    "composio",
 )
 
 app = modal.App(name="prmsoe", image=image)
@@ -101,6 +102,15 @@ class SwipeRequest(BaseModel):
     outcome: str
 
 
+class ComposioConnectRequest(BaseModel):
+    user_id: str
+    callback_url: str
+
+
+class AutoDetectRequest(BaseModel):
+    user_id: str
+
+
 # ---------------------------------------------------------------------------
 # Section 5: Helpers
 # ---------------------------------------------------------------------------
@@ -113,6 +123,22 @@ def get_supabase():
         os.environ["SUPABASE_URL"],
         os.environ["SUPABASE_SERVICE_KEY"],
     )
+
+
+def get_composio():
+    from composio import Composio
+
+    return Composio(api_key=os.environ["COMPOSIO_API_KEY"])
+
+
+def get_gmail_auth_config_id():
+    """Fetch Gmail auth_config_id dynamically from Composio."""
+    composio = get_composio()
+    configs = composio.auth_configs.list()
+    for cfg in configs.items:
+        if cfg.toolkit_slug == "gmail":
+            return cfg.id
+    raise RuntimeError("No Gmail auth config found in Composio. Set one up at platform.composio.dev")
 
 
 def search_youcom(query: str) -> dict:
@@ -349,6 +375,39 @@ async def ingest_status(job_id: str, user_id: str = Query(...)):
     }
 
 
+@web_app.get("/contacts/list")
+async def contacts_list(
+    user_id: str = Query(...),
+    limit: int = Query(default=10, le=100),
+    offset: int = Query(default=0, ge=0),
+):
+    """Return paginated contacts for a user (any status)."""
+    sb = get_supabase()
+
+    count_resp = (
+        sb.table("contacts")
+        .select("id", count="exact")
+        .eq("user_id", user_id)
+        .execute()
+    )
+    total = count_resp.count or 0
+
+    contacts_resp = (
+        sb.table("contacts")
+        .select("id, full_name, raw_role, company_name, linkedin_url, status, created_at")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .range(offset, offset + limit - 1)
+        .execute()
+    )
+
+    return {
+        "contacts": contacts_resp.data or [],
+        "total": total,
+        "has_more": (offset + limit) < total,
+    }
+
+
 @web_app.get("/feed/drafts")
 async def feed_drafts(
     user_id: str = Query(...),
@@ -526,6 +585,10 @@ async def analytics_dashboard(user_id: str = Query(...)):
 
     contact_ids = [c["id"] for c in contacts.data]
 
+    # Build contact lookup for replied message details
+    contact_info = sb.table("contacts").select("id, full_name, company_name").in_("id", contact_ids).execute()
+    contact_map = {c["id"]: c for c in (contact_info.data or [])}
+
     attempts = sb.table("outreach_attempts").select("*").in_("contact_id", contact_ids).execute()
     rows = attempts.data or []
 
@@ -538,10 +601,17 @@ async def analytics_dashboard(user_id: str = Query(...)):
     strategy_buckets: dict[str, dict] = {}
     for r in rows:
         tag = r.get("strategy_tag", "UNKNOWN")
-        bucket = strategy_buckets.setdefault(tag, {"sent": 0, "replied": 0})
+        bucket = strategy_buckets.setdefault(tag, {"sent": 0, "replied": 0, "replied_messages": []})
         bucket["sent"] += 1
         if r.get("outcome") == OutcomeType.REPLIED.value:
             bucket["replied"] += 1
+            c = contact_map.get(r["contact_id"], {})
+            bucket["replied_messages"].append({
+                "full_name": c.get("full_name", ""),
+                "company_name": c.get("company_name", ""),
+                "message_body": r.get("message_body", ""),
+                "sent_at": r.get("sent_at", ""),
+            })
 
     by_strategy = []
     for tag, b in sorted(strategy_buckets.items()):
@@ -550,6 +620,7 @@ async def analytics_dashboard(user_id: str = Query(...)):
             "sent": b["sent"],
             "replied": b["replied"],
             "reply_rate": round(b["replied"] / b["sent"], 3) if b["sent"] > 0 else 0.0,
+            "replied_messages": b["replied_messages"],
         })
 
     return {
@@ -559,6 +630,135 @@ async def analytics_dashboard(user_id: str = Query(...)):
         "global_reply_rate": global_reply_rate,
         "by_strategy": by_strategy,
     }
+
+
+# ---------------------------------------------------------------------------
+# Section 7b: Composio Gmail integration endpoints
+# ---------------------------------------------------------------------------
+
+
+@web_app.post("/composio/connect")
+async def composio_connect(req: ComposioConnectRequest):
+    """Initiate Gmail OAuth via Composio. Returns redirect_url for user to approve."""
+    composio = get_composio()
+    gmail_auth_config_id = get_gmail_auth_config_id()
+
+    connection_request = composio.connected_accounts.initiate(
+        user_id=req.user_id,
+        auth_config_id=gmail_auth_config_id,
+        callback_url=req.callback_url,
+    )
+
+    return {"redirect_url": connection_request.redirect_url}
+
+
+@web_app.get("/composio/status")
+async def composio_status(user_id: str = Query(...)):
+    """Check if user has an active Gmail connection via Composio."""
+    composio = get_composio()
+
+    connected_accounts = composio.connected_accounts.list(
+        user_ids=[user_id],
+        toolkit_slugs=["gmail"],
+    )
+
+    for account in connected_accounts.items:
+        if account.status == "ACTIVE":
+            return {"connected": True}
+
+    return {"connected": False}
+
+
+@web_app.post("/feedback/auto-detect")
+async def feedback_auto_detect(req: AutoDetectRequest):
+    """Scan Gmail for LinkedIn reply notifications and auto-mark matching outreach as REPLIED."""
+    sb = get_supabase()
+    composio = get_composio()
+
+    # 1. Get user's contacts with PENDING outreach attempts (same pattern as /feedback/queue)
+    contacts = sb.table("contacts").select("id, full_name, company_name").eq("user_id", req.user_id).execute()
+    if not contacts.data:
+        return {"detected": [], "count": 0}
+
+    contact_ids = [c["id"] for c in contacts.data]
+    contact_map = {c["id"]: c for c in contacts.data}
+
+    # Get PENDING outreach attempts (no date filter — scan all pending)
+    attempts = (
+        sb.table("outreach_attempts")
+        .select("*")
+        .in_("contact_id", contact_ids)
+        .eq("feedback_status", FeedbackStatus.PENDING.value)
+        .execute()
+    )
+
+    if not attempts.data:
+        return {"detected": [], "count": 0}
+
+    # 2. Build lookup: full_name.lower() → [outreach attempt rows]
+    name_to_attempts: dict[str, list[dict]] = {}
+    for a in attempts.data:
+        c = contact_map.get(a["contact_id"], {})
+        name = c.get("full_name", "").lower().strip()
+        if name:
+            name_to_attempts.setdefault(name, []).append(a)
+
+    # 3. Get active Gmail connected account
+    connected_accounts = composio.connected_accounts.list(
+        user_ids=[req.user_id],
+        toolkit_slugs=["gmail"],
+    )
+
+    connected_account_id = None
+    for account in connected_accounts.items:
+        if account.status == "ACTIVE":
+            connected_account_id = account.id
+            break
+
+    if not connected_account_id:
+        raise HTTPException(status_code=400, detail="Gmail not connected. Connect via /composio/connect first.")
+
+    # 4. Fetch LinkedIn notification emails via Composio
+    result = composio.tools.execute(
+        "GMAIL_FETCH_EMAILS",
+        user_id=req.user_id,
+        connected_account_id=connected_account_id,
+        arguments={
+            "query": "from:linkedin.com newer_than:3d",
+            "max_results": 50,
+        },
+    )
+
+    emails = result.get("data", {}).get("emails", []) if isinstance(result, dict) else []
+
+    # 5. Match emails to pending contacts
+    detected = []
+    matched_attempt_ids = set()
+
+    for email in emails:
+        subject = (email.get("subject") or "").lower()
+        body = (email.get("body") or email.get("snippet") or "").lower()
+        text = subject + " " + body
+
+        for name, attempt_list in name_to_attempts.items():
+            if name in text:
+                for a in attempt_list:
+                    if a["id"] not in matched_attempt_ids:
+                        matched_attempt_ids.add(a["id"])
+                        c = contact_map.get(a["contact_id"], {})
+                        detected.append({
+                            "full_name": c.get("full_name", ""),
+                            "company_name": c.get("company_name", ""),
+                        })
+
+    # 6. Update matched outreach attempts → REPLIED + COMPLETED
+    for attempt_id in matched_attempt_ids:
+        sb.table("outreach_attempts").update({
+            "outcome": OutcomeType.REPLIED.value,
+            "feedback_status": FeedbackStatus.COMPLETED.value,
+        }).eq("id", attempt_id).execute()
+
+    return {"detected": detected, "count": len(detected)}
 
 
 # ---------------------------------------------------------------------------

@@ -13,4 +13,5 @@ dependencies = [
     "python-multipart",
     "python-dotenv",
     "uvicorn",
+    "composio",
 ]
