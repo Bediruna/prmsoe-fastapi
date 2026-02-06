@@ -136,7 +136,7 @@ def get_gmail_auth_config_id():
     composio = get_composio()
     configs = composio.auth_configs.list()
     for cfg in configs.items:
-        if cfg.toolkit_slug == "gmail":
+        if cfg.toolkit.slug == "gmail":
             return cfg.id
     raise RuntimeError("No Gmail auth config found in Composio. Set one up at platform.composio.dev")
 
@@ -242,7 +242,7 @@ web_app = FastAPI(title="PRMSOE API")
 web_app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -729,7 +729,10 @@ async def feedback_auto_detect(req: AutoDetectRequest):
         },
     )
 
-    emails = result.get("data", {}).get("emails", []) if isinstance(result, dict) else []
+    response_data = result.get("data", {}) if isinstance(result, dict) else {}
+    emails = response_data.get("emails", response_data.get("messages", []))
+    if isinstance(emails, dict):
+        emails = [emails]
 
     # 5. Match emails to pending contacts
     detected = []
