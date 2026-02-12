@@ -12,11 +12,9 @@ import time
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 
-import httpx
 import modal
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 # Load .env in local dev mode (set by __main__ or manually)
@@ -37,9 +35,7 @@ image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "fastapi[standard]",
     "supabase",
     "google-genai",
-    "httpx",
     "python-multipart",
-    "composio",
 )
 
 app = modal.App(name="prmsoe", image=image)
@@ -103,15 +99,6 @@ class SwipeRequest(BaseModel):
     outcome: str
 
 
-class ComposioConnectRequest(BaseModel):
-    user_id: str
-    callback_url: str
-
-
-class AutoDetectRequest(BaseModel):
-    user_id: str
-
-
 # ---------------------------------------------------------------------------
 # Section 5: Helpers
 # ---------------------------------------------------------------------------
@@ -124,55 +111,6 @@ def get_supabase():
         os.environ["SUPABASE_URL"],
         os.environ["SUPABASE_SERVICE_KEY"],
     )
-
-
-def get_composio():
-    from composio import Composio
-
-    return Composio(api_key=os.environ["COMPOSIO_API_KEY"])
-
-
-def get_gmail_auth_config_id():
-    """Fetch Gmail auth_config_id dynamically from Composio."""
-    composio = get_composio()
-    configs = composio.auth_configs.list()
-    for cfg in configs.items:
-        if cfg.toolkit.slug == "gmail":
-            return cfg.id
-    raise RuntimeError("No Gmail auth config found in Composio. Set one up at platform.composio.dev")
-
-
-def search_youcom(query: str) -> dict:
-    """Call You.com Web Search API and return raw JSON response."""
-    resp = httpx.get(
-        "https://ydc-index.io/v1/search",
-        params={"query": query},
-        headers={"X-API-Key": os.environ["YOUCOM_API_KEY"]},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def parse_youcom_response(data: dict) -> dict:
-    """Extract structured fields from You.com search results."""
-    hits = data.get("hits", [])[:3]
-    snippets: list[str] = []
-    pain_points = ""
-    source_url = ""
-
-    for i, hit in enumerate(hits):
-        for snippet in hit.get("snippets", []):
-            snippets.append(snippet)
-        if i == 0:
-            pain_points = hit.get("description", "")
-            source_url = hit.get("url", "")
-
-    return {
-        "news_summary": " ".join(snippets)[:2000],
-        "pain_points": pain_points[:1000],
-        "source_url": source_url,
-    }
 
 
 def generate_draft(
@@ -199,11 +137,11 @@ CONTACT:
 - Role: {raw_role}
 - Company: {company_name}
 
-RESEARCH:
+CONTEXT:
 {research_summary}
 
 INSTRUCTIONS:
-1. Write a LinkedIn message under 300 characters. Be conversational, specific, and reference the research.
+1. Write a LinkedIn message under 300 characters. Be conversational, specific, and reference the context.
 2. Choose exactly ONE strategy tag from: PAIN_POINT, VALIDATION_ASK, DIRECT_PITCH, MUTUAL_CONNECTION, INDUSTRY_TREND
 3. Return ONLY valid JSON (no markdown, no code fences):
 {{"draft_message": "your message here", "strategy_tag": "TAG_HERE"}}"""
@@ -634,224 +572,6 @@ async def analytics_dashboard(user_id: str = Query(...)):
 
 
 # ---------------------------------------------------------------------------
-# Section 7b: Composio Gmail integration endpoints
-# ---------------------------------------------------------------------------
-
-
-@web_app.post("/composio/connect")
-async def composio_connect(req: ComposioConnectRequest):
-    """Initiate Gmail OAuth via Composio. Returns redirect_url for user to approve."""
-    try:
-        composio = get_composio()
-        gmail_auth_config_id = get_gmail_auth_config_id()
-
-        connection_request = composio.connected_accounts.initiate(
-            user_id=req.user_id,
-            auth_config_id=gmail_auth_config_id,
-            callback_url=req.callback_url,
-        )
-
-        return {"redirect_url": connection_request.redirect_url}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"/composio/connect error: {e}")
-        return JSONResponse(status_code=500, content={"detail": str(e)})
-
-
-@web_app.get("/composio/status")
-async def composio_status(user_id: str = Query(...)):
-    """Check if user has an active Gmail connection via Composio."""
-    composio = get_composio()
-
-    connected_accounts = composio.connected_accounts.list(
-        user_ids=[user_id],
-        toolkit_slugs=["gmail"],
-    )
-
-    for account in connected_accounts.items:
-        if account.status == "ACTIVE":
-            return {"connected": True}
-
-    return {"connected": False}
-
-
-@web_app.post("/composio/disconnect")
-async def composio_disconnect(req: AutoDetectRequest):
-    """Disconnect (unlink) user's Gmail integration via Composio."""
-    try:
-        composio = get_composio()
-
-        connected_accounts = composio.connected_accounts.list(
-            user_ids=[req.user_id],
-            toolkit_slugs=["gmail"],
-        )
-
-        for account in connected_accounts.items:
-            if account.status == "ACTIVE":
-                composio.connected_accounts.delete(account.id)
-
-        return {"ok": True}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"/composio/disconnect error: {e}")
-        return JSONResponse(status_code=500, content={"detail": str(e)})
-
-
-DEMO_USER_ID = "c877835e-4609-4075-9892-84bf9c3e8f97"
-
-
-@web_app.post("/feedback/auto-detect")
-async def feedback_auto_detect(req: AutoDetectRequest):
-    """Scan Gmail for LinkedIn reply notifications and auto-mark matching outreach as REPLIED."""
-    try:
-        sb = get_supabase()
-
-        # Mock scan for demo user — match contacts against fake LinkedIn emails
-        if req.user_id == DEMO_USER_ID:
-            mock_emails = [
-                {
-                    "from": "messaging-digest-noreply@linkedin.com",
-                    "subject": "1 new message awaits your response",
-                    "body": "Bedir Aygun Software Engineer sent you a new message. View message",
-                },
-            ]
-
-            contacts = sb.table("contacts").select("id, full_name, company_name").eq("user_id", req.user_id).execute()
-            if not contacts.data:
-                return {"detected": [], "count": 0}
-            contact_map = {c["id"]: c for c in contacts.data}
-
-            # Match mock emails against contacts by name
-            matched_contact_ids: set[str] = set()
-            detected = []
-            for email in mock_emails:
-                text = (email["subject"] + " " + email["body"]).lower()
-                for c in contacts.data:
-                    name = c.get("full_name", "").lower().strip()
-                    if name and name in text and c["id"] not in matched_contact_ids:
-                        matched_contact_ids.add(c["id"])
-                        detected.append({
-                            "full_name": c.get("full_name", ""),
-                            "company_name": c.get("company_name", ""),
-                        })
-
-            # Mark matching outreach attempts as REPLIED so cards disappear from queue
-            if matched_contact_ids:
-                attempts = (
-                    sb.table("outreach_attempts")
-                    .select("id")
-                    .in_("contact_id", list(matched_contact_ids))
-                    .eq("feedback_status", FeedbackStatus.PENDING.value)
-                    .execute()
-                )
-                for a in (attempts.data or []):
-                    sb.table("outreach_attempts").update({
-                        "outcome": OutcomeType.REPLIED.value,
-                        "feedback_status": FeedbackStatus.COMPLETED.value,
-                    }).eq("id", a["id"]).execute()
-
-            return {"detected": detected, "count": len(detected)}
-
-        composio = get_composio()
-
-        # 1. Get user's contacts with PENDING outreach attempts (same pattern as /feedback/queue)
-        contacts = sb.table("contacts").select("id, full_name, company_name").eq("user_id", req.user_id).execute()
-        if not contacts.data:
-            return {"detected": [], "count": 0}
-
-        contact_ids = [c["id"] for c in contacts.data]
-        contact_map = {c["id"]: c for c in contacts.data}
-
-        # Get PENDING outreach attempts (no date filter — scan all pending)
-        attempts = (
-            sb.table("outreach_attempts")
-            .select("*")
-            .in_("contact_id", contact_ids)
-            .eq("feedback_status", FeedbackStatus.PENDING.value)
-            .execute()
-        )
-
-        if not attempts.data:
-            return {"detected": [], "count": 0}
-
-        # 2. Build lookup: full_name.lower() → [outreach attempt rows]
-        name_to_attempts: dict[str, list[dict]] = {}
-        for a in attempts.data:
-            c = contact_map.get(a["contact_id"], {})
-            name = c.get("full_name", "").lower().strip()
-            if name:
-                name_to_attempts.setdefault(name, []).append(a)
-
-        # 3. Get active Gmail connected account
-        connected_accounts = composio.connected_accounts.list(
-            user_ids=[req.user_id],
-            toolkit_slugs=["gmail"],
-        )
-
-        connected_account_id = None
-        for account in connected_accounts.items:
-            if account.status == "ACTIVE":
-                connected_account_id = account.id
-                break
-
-        if not connected_account_id:
-            raise HTTPException(status_code=400, detail="Gmail not connected. Connect via /composio/connect first.")
-
-        # 4. Fetch LinkedIn notification emails via Composio
-        result = composio.tools.execute(
-            "GMAIL_FETCH_EMAILS",
-            user_id=req.user_id,
-            connected_account_id=connected_account_id,
-            arguments={
-                "query": "from:linkedin.com newer_than:3d",
-                "max_results": 50,
-            },
-            dangerously_skip_version_check=True,
-        )
-
-        response_data = result.get("data", {}) if isinstance(result, dict) else {}
-        emails = response_data.get("emails", response_data.get("messages", []))
-        if isinstance(emails, dict):
-            emails = [emails]
-
-        # 5. Match emails to pending contacts
-        detected = []
-        matched_attempt_ids = set()
-
-        for email in emails:
-            subject = (email.get("subject") or "").lower()
-            body = (email.get("body") or email.get("snippet") or "").lower()
-            text = subject + " " + body
-
-            for name, attempt_list in name_to_attempts.items():
-                if name in text:
-                    for a in attempt_list:
-                        if a["id"] not in matched_attempt_ids:
-                            matched_attempt_ids.add(a["id"])
-                            c = contact_map.get(a["contact_id"], {})
-                            detected.append({
-                                "full_name": c.get("full_name", ""),
-                                "company_name": c.get("company_name", ""),
-                            })
-
-        # 6. Update matched outreach attempts → REPLIED + COMPLETED
-        for attempt_id in matched_attempt_ids:
-            sb.table("outreach_attempts").update({
-                "outcome": OutcomeType.REPLIED.value,
-                "feedback_status": FeedbackStatus.COMPLETED.value,
-            }).eq("id", attempt_id).execute()
-
-        return {"detected": detected, "count": len(detected)}
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"/feedback/auto-detect error: {e}")
-        return JSONResponse(status_code=500, content={"detail": str(e)})
-
-
-# ---------------------------------------------------------------------------
 # Section 8: enrich_batch (background Modal function)
 # ---------------------------------------------------------------------------
 
@@ -861,7 +581,7 @@ async def feedback_auto_detect(req: AutoDetectRequest):
     timeout=3600,
 )
 def enrich_batch(job_id: str, contact_ids: list[str]):
-    """Process contacts sequentially: research via You.com, draft via Gemini."""
+    """Process contacts sequentially: draft via Gemini using role/company context."""
     sb = get_supabase()
 
     # Fetch user profile for mission/intent context
@@ -894,27 +614,8 @@ def enrich_batch(job_id: str, contact_ids: list[str]):
             full_name = c["full_name"]
             raw_role = c["raw_role"]
 
-            # You.com search (non-fatal — enrichment continues without research)
-            search_query = f"{company} recent news problems"
-            parsed = {"news_summary": "", "pain_points": "", "source_url": ""}
-            raw_response = {}
-            try:
-                raw_response = search_youcom(search_query)
-                parsed = parse_youcom_response(raw_response)
-            except Exception as search_err:
-                logger.warning(f"Research failed for {contact_id}, proceeding without: {search_err}")
-
-            # Insert research
-            sb.table("research").insert({
-                "contact_id": contact_id,
-                "news_summary": parsed["news_summary"],
-                "pain_points": parsed["pain_points"],
-                "source_url": parsed["source_url"],
-                "raw_response": raw_response,
-            }).execute()
-
-            # Generate draft via Gemini
-            research_text = f"News: {parsed['news_summary']}\nPain points: {parsed['pain_points']}"
+            # Generate draft via Gemini (role + company context)
+            research_text = f"Role: {raw_role}\nCompany: {company}"
             draft_result = generate_draft(
                 mission_statement=mission,
                 intent_type=intent,
