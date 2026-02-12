@@ -2,34 +2,27 @@
 End-to-end test for all PRMSOE endpoints.
 
 Usage:
-    1. Start server:  python app.py
-    2. Run tests:     python test_endpoints.py
+        1. Start server:  python app.py
+        2. Run tests:     python test_endpoints.py
 
-Creates a test user in Supabase auth + profiles, then exercises the full flow:
-  upload CSV → poll status → get drafts → send → feedback queue → swipe → analytics
+Creates a test profile in Postgres, then exercises the full flow:
+    upload CSV → poll status → get drafts → send → feedback queue → swipe → analytics
 """
 
 import os
 import sys
 import time
+import uuid
 
 import httpx
+import psycopg
 from dotenv import load_dotenv
+from psycopg.rows import dict_row
 
 load_dotenv()
 
 BASE = os.environ.get("TEST_BASE_URL", "http://localhost:8000")
-SUPABASE_URL = os.environ["SUPABASE_URL"]
-SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-
-sb_headers = {
-    "apikey": SUPABASE_SERVICE_KEY,
-    "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}",
-    "Content-Type": "application/json",
-}
-
-TEST_EMAIL = "testuser@prmsoe-test.local"
-TEST_PASSWORD = "testpass123456"
+DATABASE_URL = os.environ.get("TEST_DATABASE_URL") or os.environ["DATABASE_URL"]
 
 client = httpx.Client(base_url=BASE, timeout=30)
 
@@ -46,73 +39,48 @@ def log(label: str, data):
 
 
 def setup_test_user() -> str:
-    """Create (or retrieve) a test user in Supabase Auth + profiles table."""
-    sb = httpx.Client(base_url=SUPABASE_URL, headers=sb_headers, timeout=15)
-
-    # Try to create user via Auth admin API
-    resp = sb.post("/auth/v1/admin/users", json={
-        "email": TEST_EMAIL,
-        "password": TEST_PASSWORD,
-        "email_confirm": True,
-    })
-
-    if resp.status_code == 200:
-        user_id = resp.json()["id"]
-        log("Created test user", {"user_id": user_id, "email": TEST_EMAIL})
-    elif resp.status_code == 422:
-        # User already exists — fetch by email
-        resp2 = sb.get("/auth/v1/admin/users")
-        users = resp2.json().get("users", [])
-        user_id = next(u["id"] for u in users if u.get("email") == TEST_EMAIL)
-        log("Found existing test user", {"user_id": user_id})
-    else:
-        print(f"Failed to create user: {resp.status_code} {resp.text}")
-        sys.exit(1)
-
-    # Ensure profiles row exists
-    resp = sb.get(
-        "/rest/v1/profiles",
-        params={"id": f"eq.{user_id}", "select": "id"},
-        headers={**sb_headers, "Prefer": "return=representation"},
-    )
-    if not resp.json():
-        sb.post(
-            "/rest/v1/profiles",
-            json={
-                "id": user_id,
-                "mission_statement": "I want to reduce food waste in urban areas",
-                "intent_type": "VALIDATION",
-            },
-            headers={**sb_headers, "Prefer": "return=representation"},
-        )
-        log("Created profile", {"mission": "I want to reduce food waste in urban areas"})
-
-    sb.close()
+    """Create a test profile in Postgres and return the user_id."""
+    user_id = str(uuid.uuid4())
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO profiles (id, mission_statement, intent_type)
+                VALUES (%s, %s, %s)
+                """,
+                (
+                    user_id,
+                    "I want to reduce food waste in urban areas",
+                    "VALIDATION",
+                ),
+            )
+        conn.commit()
+    log("Created profile", {"user_id": user_id})
     return user_id
 
 
 def cleanup_test_data(user_id: str):
     """Remove test data from previous runs (contacts, research, jobs, outreach)."""
-    sb = httpx.Client(base_url=SUPABASE_URL, headers=sb_headers, timeout=15)
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id FROM contacts WHERE user_id = %s", (user_id,))
+            contact_ids = [c["id"] for c in cur.fetchall()]
 
-    # Get contact IDs for this user
-    resp = sb.get("/rest/v1/contacts", params={"user_id": f"eq.{user_id}", "select": "id"})
-    contact_ids = [c["id"] for c in resp.json()]
+            if contact_ids:
+                cur.execute(
+                    "DELETE FROM outreach_attempts WHERE contact_id = ANY(%s)",
+                    (contact_ids,),
+                )
+                cur.execute(
+                    "DELETE FROM research WHERE contact_id = ANY(%s)",
+                    (contact_ids,),
+                )
 
-    if contact_ids:
-        # Delete outreach_attempts for these contacts
-        for cid in contact_ids:
-            sb.delete("/rest/v1/outreach_attempts", params={"contact_id": f"eq.{cid}"})
-        # Delete research for these contacts
-        for cid in contact_ids:
-            sb.delete("/rest/v1/research", params={"contact_id": f"eq.{cid}"})
-        # Delete contacts
-        sb.delete("/rest/v1/contacts", params={"user_id": f"eq.{user_id}"})
+            cur.execute("DELETE FROM contacts WHERE user_id = %s", (user_id,))
+            cur.execute("DELETE FROM enrichment_jobs WHERE user_id = %s", (user_id,))
+            cur.execute("DELETE FROM profiles WHERE id = %s", (user_id,))
 
-    # Delete enrichment jobs
-    sb.delete("/rest/v1/enrichment_jobs", params={"user_id": f"eq.{user_id}"})
-
-    sb.close()
+        conn.commit()
     log("Cleanup", f"Removed {len(contact_ids)} contacts + related data")
 
 

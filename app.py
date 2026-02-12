@@ -16,6 +16,8 @@ import modal
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
 # Load .env in local dev mode (set by __main__ or manually)
 if os.environ.get("LOCAL_DEV", "").lower() in ("1", "true"):
@@ -33,7 +35,8 @@ LOCAL_DEV = os.environ.get("LOCAL_DEV", "").lower() in ("1", "true")
 
 image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "fastapi[standard]",
-    "supabase",
+    "psycopg[binary]",
+    "psycopg-pool",
     "google-genai",
     "python-multipart",
 )
@@ -104,13 +107,85 @@ class SwipeRequest(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def get_supabase():
-    from supabase import create_client
+_DB_POOL: ConnectionPool | None = None
 
-    return create_client(
-        os.environ["SUPABASE_URL"],
-        os.environ["SUPABASE_SERVICE_KEY"],
+
+def get_db_pool() -> ConnectionPool:
+    global _DB_POOL
+    if _DB_POOL is None:
+        _DB_POOL = ConnectionPool(
+            os.environ["DATABASE_URL"],
+            max_size=5,
+            kwargs={"row_factory": dict_row},
+        )
+    return _DB_POOL
+
+
+def db_fetch_one(query: str, params: tuple | None = None) -> dict | None:
+    pool = get_db_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+
+
+def db_fetch_all(query: str, params: tuple | None = None) -> list[dict]:
+    pool = get_db_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return list(cur.fetchall())
+
+
+def db_execute(query: str, params: tuple | None = None) -> None:
+    pool = get_db_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            conn.commit()
+
+
+def db_execute_returning(query: str, params: tuple | None = None) -> list[dict]:
+    pool = get_db_pool()
+    with pool.connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            rows = list(cur.fetchall())
+            conn.commit()
+            return rows
+
+
+def insert_contacts(rows: list[dict]) -> list[str]:
+    if not rows:
+        return []
+
+    columns = (
+        "user_id",
+        "full_name",
+        "company_name",
+        "raw_role",
+        "linkedin_url",
+        "status",
     )
+    values_sql = ",".join(["(%s, %s, %s, %s, %s, %s)"] * len(rows))
+    query = (
+        "INSERT INTO contacts "
+        f"({', '.join(columns)}) "
+        f"VALUES {values_sql} "
+        "RETURNING id"
+    )
+    params: list[str] = []
+    for row in rows:
+        params.extend([
+            row["user_id"],
+            row["full_name"],
+            row["company_name"],
+            row["raw_role"],
+            row["linkedin_url"],
+            row["status"],
+        ])
+    inserted = db_execute_returning(query, tuple(params))
+    return [row["id"] for row in inserted]
 
 
 def generate_draft(
@@ -198,11 +273,12 @@ async def ingest_upload(
     user_id: str = Form(...),
 ):
     """Parse LinkedIn CSV, insert contacts, kick off enrichment."""
-    sb = get_supabase()
-
     # Validate user exists
-    profile = sb.table("profiles").select("id, mission_statement, intent_type").eq("id", user_id).execute()
-    if not profile.data:
+    profile = db_fetch_one(
+        "SELECT id, mission_statement, intent_type FROM profiles WHERE id = %s",
+        (user_id,),
+    )
+    if not profile:
         raise HTTPException(status_code=404, detail="User profile not found")
 
     # Read and decode CSV
@@ -250,34 +326,60 @@ async def ingest_upload(
 
     if not contacts_to_insert:
         # Empty CSV — create completed job immediately
-        job = sb.table("enrichment_jobs").insert({
-            "user_id": user_id,
-            "total_contacts": 0,
-            "processed_count": 0,
-            "failed_count": 0,
-            "status": JobStatus.COMPLETED.value,
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        job_rows = db_execute_returning(
+            """
+            INSERT INTO enrichment_jobs (
+                user_id,
+                total_contacts,
+                processed_count,
+                failed_count,
+                status,
+                completed_at
+            )
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                user_id,
+                0,
+                0,
+                0,
+                JobStatus.COMPLETED.value,
+                datetime.now(timezone.utc),
+            ),
+        )
         return {
             "contacts_created": 0,
             "contacts_skipped": skipped,
-            "job_id": job.data[0]["id"],
+            "job_id": job_rows[0]["id"],
             "message": "No valid contacts found in CSV",
         }
 
     # Bulk insert contacts
-    inserted = sb.table("contacts").insert(contacts_to_insert).execute()
-    contact_ids = [c["id"] for c in inserted.data]
+    contact_ids = insert_contacts(contacts_to_insert)
 
     # Create enrichment job
-    job = sb.table("enrichment_jobs").insert({
-        "user_id": user_id,
-        "total_contacts": len(contact_ids),
-        "processed_count": 0,
-        "failed_count": 0,
-        "status": JobStatus.RUNNING.value,
-    }).execute()
-    job_id = job.data[0]["id"]
+    job_rows = db_execute_returning(
+        """
+        INSERT INTO enrichment_jobs (
+            user_id,
+            total_contacts,
+            processed_count,
+            failed_count,
+            status
+        )
+        VALUES (%s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            user_id,
+            len(contact_ids),
+            0,
+            0,
+            JobStatus.RUNNING.value,
+        ),
+    )
+    job_id = job_rows[0]["id"]
 
     # Spawn background enrichment
     if LOCAL_DEV:
@@ -300,11 +402,12 @@ async def ingest_upload(
 @web_app.get("/ingest/status/{job_id}")
 async def ingest_status(job_id: str, user_id: str = Query(...)):
     """Return enrichment job progress."""
-    sb = get_supabase()
-    result = sb.table("enrichment_jobs").select("*").eq("id", job_id).eq("user_id", user_id).execute()
-    if not result.data:
+    row = db_fetch_one(
+        "SELECT * FROM enrichment_jobs WHERE id = %s AND user_id = %s",
+        (job_id, user_id),
+    )
+    if not row:
         raise HTTPException(status_code=404, detail="Job not found")
-    row = result.data[0]
     return {
         "job_id": row["id"],
         "status": row["status"],
@@ -321,27 +424,25 @@ async def contacts_list(
     offset: int = Query(default=0, ge=0),
 ):
     """Return paginated contacts for a user (any status)."""
-    sb = get_supabase()
-
-    count_resp = (
-        sb.table("contacts")
-        .select("id", count="exact")
-        .eq("user_id", user_id)
-        .execute()
+    total_row = db_fetch_one(
+        "SELECT COUNT(*) AS total FROM contacts WHERE user_id = %s",
+        (user_id,),
     )
-    total = count_resp.count or 0
+    total = int(total_row["total"]) if total_row else 0
 
-    contacts_resp = (
-        sb.table("contacts")
-        .select("id, full_name, raw_role, company_name, linkedin_url, status, created_at")
-        .eq("user_id", user_id)
-        .order("created_at", desc=True)
-        .range(offset, offset + limit - 1)
-        .execute()
+    contacts = db_fetch_all(
+        """
+        SELECT id, full_name, raw_role, company_name, linkedin_url, status, created_at
+        FROM contacts
+        WHERE user_id = %s
+        ORDER BY created_at DESC
+        LIMIT %s OFFSET %s
+        """,
+        (user_id, limit, offset),
     )
 
     return {
-        "contacts": contacts_resp.data or [],
+        "contacts": contacts,
         "total": total,
         "has_more": (offset + limit) < total,
     }
@@ -354,36 +455,37 @@ async def feed_drafts(
     offset: int = Query(default=0, ge=0),
 ):
     """Return contacts with DRAFT_READY status and their research."""
-    sb = get_supabase()
-
-    # Get total count
-    count_resp = (
-        sb.table("contacts")
-        .select("id", count="exact")
-        .eq("user_id", user_id)
-        .eq("status", ContactStatus.DRAFT_READY.value)
-        .execute()
+    total_row = db_fetch_one(
+        """
+        SELECT COUNT(*) AS total
+        FROM contacts
+        WHERE user_id = %s AND status = %s
+        """,
+        (user_id, ContactStatus.DRAFT_READY.value),
     )
-    total = count_resp.count or 0
+    total = int(total_row["total"]) if total_row else 0
 
-    # Get paginated contacts
-    contacts_resp = (
-        sb.table("contacts")
-        .select("*")
-        .eq("user_id", user_id)
-        .eq("status", ContactStatus.DRAFT_READY.value)
-        .order("created_at", desc=True)
-        .range(offset, offset + limit - 1)
-        .execute()
+    contacts = db_fetch_all(
+        """
+        SELECT *
+        FROM contacts
+        WHERE user_id = %s AND status = %s
+        ORDER BY created_at DESC
+        LIMIT %s OFFSET %s
+        """,
+        (user_id, ContactStatus.DRAFT_READY.value, limit, offset),
     )
 
     drafts = []
-    if contacts_resp.data:
-        contact_ids = [c["id"] for c in contacts_resp.data]
-        research_resp = sb.table("research").select("*").in_("contact_id", contact_ids).execute()
-        research_map = {r["contact_id"]: r for r in (research_resp.data or [])}
+    if contacts:
+        contact_ids = [c["id"] for c in contacts]
+        research = db_fetch_all(
+            "SELECT * FROM research WHERE contact_id = ANY(%s)",
+            (contact_ids,),
+        )
+        research_map = {r["contact_id"]: r for r in research}
 
-        for c in contacts_resp.data:
+        for c in contacts:
             r = research_map.get(c["id"], {})
             drafts.append({
                 "contact_id": c["id"],
@@ -410,31 +512,49 @@ async def feed_drafts(
 @web_app.post("/action/send")
 async def action_send(req: SendRequest):
     """Mark contact as sent and create outreach attempt."""
-    sb = get_supabase()
-
     # Verify contact exists
-    contact = sb.table("contacts").select("id, status").eq("id", req.contact_id).execute()
-    if not contact.data:
+    contact = db_fetch_one(
+        "SELECT id, status FROM contacts WHERE id = %s",
+        (req.contact_id,),
+    )
+    if not contact:
         raise HTTPException(status_code=404, detail="Contact not found")
 
     now = datetime.now(timezone.utc)
     feedback_due = now + timedelta(days=3)
 
     # Update contact status
-    sb.table("contacts").update({"status": ContactStatus.SENT.value}).eq("id", req.contact_id).execute()
+    db_execute(
+        "UPDATE contacts SET status = %s WHERE id = %s",
+        (ContactStatus.SENT.value, req.contact_id),
+    )
 
     # Insert outreach attempt
-    outreach = sb.table("outreach_attempts").insert({
-        "contact_id": req.contact_id,
-        "strategy_tag": req.strategy_tag,
-        "message_body": req.message_body,
-        "sent_at": now.isoformat(),
-        "feedback_due_at": feedback_due.isoformat(),
-        "feedback_status": FeedbackStatus.PENDING.value,
-    }).execute()
+    outreach_rows = db_execute_returning(
+        """
+        INSERT INTO outreach_attempts (
+            contact_id,
+            strategy_tag,
+            message_body,
+            sent_at,
+            feedback_due_at,
+            feedback_status
+        )
+        VALUES (%s, %s, %s, %s, %s, %s)
+        RETURNING id
+        """,
+        (
+            req.contact_id,
+            req.strategy_tag,
+            req.message_body,
+            now,
+            feedback_due,
+            FeedbackStatus.PENDING.value,
+        ),
+    )
 
     return {
-        "outreach_id": outreach.data[0]["id"],
+        "outreach_id": outreach_rows[0]["id"],
         "feedback_due_at": feedback_due.isoformat(),
     }
 
@@ -442,36 +562,42 @@ async def action_send(req: SendRequest):
 @web_app.get("/feedback/queue")
 async def feedback_queue(user_id: str = Query(...)):
     """Return outreach attempts where feedback is due."""
-    sb = get_supabase()
-
     # Get user's contact IDs
-    contacts = sb.table("contacts").select("id").eq("user_id", user_id).execute()
-    if not contacts.data:
+    contacts = db_fetch_all(
+        "SELECT id FROM contacts WHERE user_id = %s",
+        (user_id,),
+    )
+    if not contacts:
         return {"pending": []}
 
-    contact_ids = [c["id"] for c in contacts.data]
-    now = datetime.now(timezone.utc).isoformat()
+    contact_ids = [c["id"] for c in contacts]
+    now = datetime.now(timezone.utc)
 
     # Get pending outreach attempts where feedback is due
-    attempts = (
-        sb.table("outreach_attempts")
-        .select("*")
-        .in_("contact_id", contact_ids)
-        .lte("feedback_due_at", now)
-        .eq("feedback_status", FeedbackStatus.PENDING.value)
-        .execute()
+    attempts = db_fetch_all(
+        """
+        SELECT *
+        FROM outreach_attempts
+        WHERE contact_id = ANY(%s)
+          AND feedback_due_at <= %s
+          AND feedback_status = %s
+        """,
+        (contact_ids, now, FeedbackStatus.PENDING.value),
     )
 
-    if not attempts.data:
+    if not attempts:
         return {"pending": []}
 
     # Build contact lookup for names
-    due_contact_ids = list({a["contact_id"] for a in attempts.data})
-    contact_info = sb.table("contacts").select("id, full_name, company_name").in_("id", due_contact_ids).execute()
-    contact_map = {c["id"]: c for c in (contact_info.data or [])}
+    due_contact_ids = list({a["contact_id"] for a in attempts})
+    contact_info = db_fetch_all(
+        "SELECT id, full_name, company_name FROM contacts WHERE id = ANY(%s)",
+        (due_contact_ids,),
+    )
+    contact_map = {c["id"]: c for c in contact_info}
 
     pending = []
-    for a in attempts.data:
+    for a in attempts:
         c = contact_map.get(a["contact_id"], {})
         pending.append({
             "outreach_id": a["id"],
@@ -488,20 +614,26 @@ async def feedback_queue(user_id: str = Query(...)):
 @web_app.post("/feedback/swipe")
 async def feedback_swipe(req: SwipeRequest):
     """Record feedback outcome for an outreach attempt."""
-    sb = get_supabase()
-
     # Validate outcome
     if req.outcome not in {t.value for t in OutcomeType}:
         raise HTTPException(status_code=400, detail=f"Invalid outcome: {req.outcome}")
 
-    result = sb.table("outreach_attempts").select("id").eq("id", req.outreach_id).execute()
-    if not result.data:
+    result = db_fetch_one(
+        "SELECT id FROM outreach_attempts WHERE id = %s",
+        (req.outreach_id,),
+    )
+    if not result:
         raise HTTPException(status_code=404, detail="Outreach attempt not found")
 
-    sb.table("outreach_attempts").update({
-        "outcome": req.outcome,
-        "feedback_status": FeedbackStatus.COMPLETED.value,
-    }).eq("id", req.outreach_id).execute()
+    db_execute(
+        """
+        UPDATE outreach_attempts
+        SET outcome = %s,
+            feedback_status = %s
+        WHERE id = %s
+        """,
+        (req.outcome, FeedbackStatus.COMPLETED.value, req.outreach_id),
+    )
 
     return {"ok": True}
 
@@ -509,11 +641,12 @@ async def feedback_swipe(req: SwipeRequest):
 @web_app.get("/analytics/dashboard")
 async def analytics_dashboard(user_id: str = Query(...)):
     """Aggregate outreach metrics for user."""
-    sb = get_supabase()
-
     # Get user's contact IDs
-    contacts = sb.table("contacts").select("id").eq("user_id", user_id).execute()
-    if not contacts.data:
+    contacts = db_fetch_all(
+        "SELECT id FROM contacts WHERE user_id = %s",
+        (user_id,),
+    )
+    if not contacts:
         return {
             "total_sent": 0,
             "total_completed": 0,
@@ -522,14 +655,19 @@ async def analytics_dashboard(user_id: str = Query(...)):
             "by_strategy": [],
         }
 
-    contact_ids = [c["id"] for c in contacts.data]
+    contact_ids = [c["id"] for c in contacts]
 
     # Build contact lookup for replied message details
-    contact_info = sb.table("contacts").select("id, full_name, company_name").in_("id", contact_ids).execute()
-    contact_map = {c["id"]: c for c in (contact_info.data or [])}
+    contact_info = db_fetch_all(
+        "SELECT id, full_name, company_name FROM contacts WHERE id = ANY(%s)",
+        (contact_ids,),
+    )
+    contact_map = {c["id"]: c for c in contact_info}
 
-    attempts = sb.table("outreach_attempts").select("*").in_("contact_id", contact_ids).execute()
-    rows = attempts.data or []
+    rows = db_fetch_all(
+        "SELECT * FROM outreach_attempts WHERE contact_id = ANY(%s)",
+        (contact_ids,),
+    )
 
     total_sent = len(rows)
     total_completed = sum(1 for r in rows if r.get("feedback_status") == FeedbackStatus.COMPLETED.value)
@@ -582,37 +720,47 @@ async def analytics_dashboard(user_id: str = Query(...)):
 )
 def enrich_batch(job_id: str, contact_ids: list[str]):
     """Process contacts sequentially: draft via Gemini using role/company context."""
-    sb = get_supabase()
-
     # Fetch user profile for mission/intent context
-    job = sb.table("enrichment_jobs").select("user_id").eq("id", job_id).execute()
-    if not job.data:
+    job = db_fetch_one(
+        "SELECT user_id FROM enrichment_jobs WHERE id = %s",
+        (job_id,),
+    )
+    if not job:
         logger.error(f"Job {job_id} not found")
         return
-    user_id = job.data[0]["user_id"]
+    user_id = job["user_id"]
 
-    profile = sb.table("profiles").select("mission_statement, intent_type").eq("id", user_id).execute()
-    mission = profile.data[0]["mission_statement"] if profile.data else ""
-    intent = profile.data[0]["intent_type"] if profile.data else "VALIDATION"
+    profile = db_fetch_one(
+        "SELECT mission_statement, intent_type FROM profiles WHERE id = %s",
+        (user_id,),
+    )
+    mission = profile["mission_statement"] if profile else ""
+    intent = profile["intent_type"] if profile else "VALIDATION"
 
     for i, contact_id in enumerate(contact_ids):
         try:
             # Set status to RESEARCHING
-            sb.table("contacts").update({"status": ContactStatus.RESEARCHING.value}).eq("id", contact_id).execute()
+            db_execute(
+                "UPDATE contacts SET status = %s WHERE id = %s",
+                (ContactStatus.RESEARCHING.value, contact_id),
+            )
 
             # Fetch contact details
-            contact = sb.table("contacts").select("full_name, company_name, raw_role").eq("id", contact_id).execute()
-            if not contact.data:
+            contact = db_fetch_one(
+                "SELECT full_name, company_name, raw_role FROM contacts WHERE id = %s",
+                (contact_id,),
+            )
+            if not contact:
                 logger.warning(f"Contact {contact_id} not found, skipping")
-                sb.table("enrichment_jobs").update({
-                    "failed_count": sb.table("enrichment_jobs").select("failed_count").eq("id", job_id).execute().data[0]["failed_count"] + 1,
-                }).eq("id", job_id).execute()
+                db_execute(
+                    "UPDATE enrichment_jobs SET failed_count = failed_count + 1 WHERE id = %s",
+                    (job_id,),
+                )
                 continue
 
-            c = contact.data[0]
-            company = c["company_name"]
-            full_name = c["full_name"]
-            raw_role = c["raw_role"]
+            company = contact["company_name"]
+            full_name = contact["full_name"]
+            raw_role = contact["raw_role"]
 
             # Generate draft via Gemini (role + company context)
             research_text = f"Role: {raw_role}\nCompany: {company}"
@@ -626,27 +774,37 @@ def enrich_batch(job_id: str, contact_ids: list[str]):
             )
 
             # Update contact with draft
-            sb.table("contacts").update({
-                "draft_message": draft_result["draft_message"],
-                "strategy_tag": draft_result["strategy_tag"],
-                "status": ContactStatus.DRAFT_READY.value,
-            }).eq("id", contact_id).execute()
+            db_execute(
+                """
+                UPDATE contacts
+                SET draft_message = %s,
+                    strategy_tag = %s,
+                    status = %s
+                WHERE id = %s
+                """,
+                (
+                    draft_result["draft_message"],
+                    draft_result["strategy_tag"],
+                    ContactStatus.DRAFT_READY.value,
+                    contact_id,
+                ),
+            )
 
             # Increment processed count
-            current = sb.table("enrichment_jobs").select("processed_count").eq("id", job_id).execute()
-            sb.table("enrichment_jobs").update({
-                "processed_count": current.data[0]["processed_count"] + 1,
-            }).eq("id", job_id).execute()
+            db_execute(
+                "UPDATE enrichment_jobs SET processed_count = processed_count + 1 WHERE id = %s",
+                (job_id,),
+            )
 
             logger.info(f"Enriched contact {i + 1}/{len(contact_ids)}: {full_name} @ {company}")
 
         except Exception as e:
             logger.error(f"Failed to enrich contact {contact_id}: {e}")
             try:
-                current = sb.table("enrichment_jobs").select("failed_count").eq("id", job_id).execute()
-                sb.table("enrichment_jobs").update({
-                    "failed_count": current.data[0]["failed_count"] + 1,
-                }).eq("id", job_id).execute()
+                db_execute(
+                    "UPDATE enrichment_jobs SET failed_count = failed_count + 1 WHERE id = %s",
+                    (job_id,),
+                )
             except Exception as inner_e:
                 logger.error(f"Failed to update failed_count: {inner_e}")
 
@@ -655,10 +813,15 @@ def enrich_batch(job_id: str, contact_ids: list[str]):
             time.sleep(2)
 
     # Mark job completed
-    sb.table("enrichment_jobs").update({
-        "status": JobStatus.COMPLETED.value,
-        "completed_at": datetime.now(timezone.utc).isoformat(),
-    }).eq("id", job_id).execute()
+    db_execute(
+        """
+        UPDATE enrichment_jobs
+        SET status = %s,
+            completed_at = %s
+        WHERE id = %s
+        """,
+        (JobStatus.COMPLETED.value, datetime.now(timezone.utc), job_id),
+    )
 
     logger.info(f"Job {job_id} completed")
 
