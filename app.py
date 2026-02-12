@@ -1,4 +1,4 @@
-"""PRMSOE – Modal + FastAPI backend for AI-driven LinkedIn outreach."""
+"""Cerebro – Modal + FastAPI backend for AI-driven LinkedIn outreach."""
 
 from __future__ import annotations
 
@@ -41,9 +41,9 @@ image = modal.Image.debian_slim(python_version="3.12").pip_install(
     "python-multipart",
 )
 
-app = modal.App(name="prmsoe", image=image)
+app = modal.App(name="cerebro", image=image)
 
-logger = logging.getLogger("prmsoe")
+logger = logging.getLogger("cerebro")
 logging.basicConfig(level=logging.INFO)
 
 # ---------------------------------------------------------------------------
@@ -251,7 +251,7 @@ INSTRUCTIONS:
 # Section 6: FastAPI app + CORS
 # ---------------------------------------------------------------------------
 
-web_app = FastAPI(title="PRMSOE API")
+web_app = FastAPI(title="Cerebro API")
 
 web_app.add_middleware(
     CORSMiddleware,
@@ -715,7 +715,7 @@ async def analytics_dashboard(user_id: str = Query(...)):
 
 
 @app.function(
-    secrets=[modal.Secret.from_name("prmsoe-secrets")],
+    secrets=[modal.Secret.from_name("cerebro-secrets")],
     timeout=3600,
 )
 def enrich_batch(job_id: str, contact_ids: list[str]):
@@ -832,7 +832,7 @@ def enrich_batch(job_id: str, contact_ids: list[str]):
 
 
 @app.function(
-    secrets=[modal.Secret.from_name("prmsoe-secrets")],
+    secrets=[modal.Secret.from_name("cerebro-secrets")],
 )
 @modal.asgi_app()
 def fastapi_app():

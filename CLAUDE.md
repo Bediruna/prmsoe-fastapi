@@ -1,4 +1,4 @@
-# PRMSOE Fast API
+# Cerebro Fast API
 
 Modal + FastAPI backend for AI-driven LinkedIn outreach tool (market validation engine).
 
@@ -20,7 +20,7 @@ modal deploy app.py           # Deploy to production
 
 ## Environment Variables
 
-Set in Modal dashboard → Settings → Secrets (secret group: `prmsoe-secrets`):
+Set in Modal dashboard → Settings → Secrets (secret group: `cerebro-secrets`):
 
 - `DATABASE_URL` — Neon Postgres connection string
 - `GEMINI_API_KEY` — Google AI Studio API key

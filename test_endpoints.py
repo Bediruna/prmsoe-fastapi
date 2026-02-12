@@ -1,5 +1,5 @@
 """
-End-to-end test for all PRMSOE endpoints.
+End-to-end test for all Cerebro endpoints.
 
 Usage:
         1. Start server:  python app.py
@@ -185,7 +185,7 @@ def test_analytics(user_id: str):
 
 
 def main():
-    print("PRMSOE End-to-End Test")
+    print("Cerebro End-to-End Test")
     print(f"Target: {BASE}\n")
 
     # Setup

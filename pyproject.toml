@@ -1,5 +1,5 @@
 [project]
-name = "prmsoe-fast-api"
+name = "cerebro-fast-api"
 version = "0.1.0"
 description = "Modal + FastAPI backend for AI-driven LinkedIn outreach tool"
 readme = "README.md"
